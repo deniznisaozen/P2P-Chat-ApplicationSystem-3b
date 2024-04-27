@@ -1,23 +1,266 @@
-﻿
-Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.9.34728.123
-MinimumVisualStudioVersion = 10.0.40219.1
-Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "PythonApplication3b", "PythonApplication3b\PythonApplication3b.pyproj", "{A6D7B3A5-8758-438C-ACBD-E39B2D7DAE91}"
-EndProject
-Global
-	GlobalSection(SolutionConfigurationPlatforms) = preSolution
-		Debug|Any CPU = Debug|Any CPU
-		Release|Any CPU = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{A6D7B3A5-8758-438C-ACBD-E39B2D7DAE91}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A6D7B3A5-8758-438C-ACBD-E39B2D7DAE91}.Release|Any CPU.ActiveCfg = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
-	EndGlobalSection
-	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {B216F1DE-D8D2-469F-8B74-BAD06494CCA7}
-	EndGlobalSection
-EndGlobal
+import socket
+import json
+import threading
+import time
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+class DiffieHellman:
+    def __init__(self):
+        self.parameters = dh.generate_parameters(generator=2, key_size=2048, backend=default_backend())
+        self.private_key = self.parameters.generate_private_key()
+        self.public_key = self.private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+    def get_public_key(self):
+        return self.public_key
+
+    def generate_shared_secret(self, peer_public_key):
+        peer_public_key = serialization.load_pem_public_key(peer_public_key, backend=default_backend())
+        shared_key = self.private_key.exchange(peer_public_key)
+        return shared_key
+
+class DefaultChat:
+    def __init__(self, app, username, peer_ip, shared_secret):
+        self.app = app
+        self.username = username
+        self.peer_ip = peer_ip
+        self.shared_secret = shared_secret
+        self.lock = threading.Lock()  # Lock for thread safety
+
+    def send_message(self, message):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((self.peer_ip, 6001))
+                if self.shared_secret is not None:
+                    encrypted_message = self.encrypt_message(message)
+                    json_message = json.dumps({"encrypted_message": encrypted_message})
+                else:
+                    json_message = json.dumps({"unencrypted_message": message})
+                s.sendall(json_message.encode())
+                self.app.update_chat_display(f"You: {message}")
+        except Exception as e:
+            self.app.show_error("Send Message Error", str(e))
+
+    def receive_messages(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('0.0.0.0', 6001))
+                s.listen(1)
+                conn, _ = s.accept()
+                while True:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                    message = json.loads(data.decode())
+                    if 'unencrypted_message' in message:
+                        self.app.update_chat_display(f"{self.username}: {message['unencrypted_message']}")
+                    elif 'encrypted_message' in message:
+                        decrypted_message = self.decrypt_message(message['encrypted_message'])
+                        self.app.update_chat_display(f"{self.username}: {decrypted_message}")
+                    elif 'key' in message:
+                        with self.lock:
+                            dh = DiffieHellman()
+                            public_key = dh.get_public_key()
+                            json_message = json.dumps({"key": public_key})
+                            conn.sendall(json_message.encode())
+                            peer_public_key = json.loads(data.decode())['key']
+                            shared_secret = dh.generate_shared_secret(peer_public_key)
+                            self.shared_secret = shared_secret
+        except Exception as e:
+            self.app.show_error("Receive Message Error", str(e))
+        finally:
+            conn.close()
+
+    def encrypt_message(self, message):
+        cipher = Cipher(algorithms.AES(self.shared_secret), modes.CTR(b'\x00' * 16), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(message.encode()) + encryptor.finalize()
+        return ciphertext
+
+    def decrypt_message(self, encrypted_message):
+        cipher = Cipher(algorithms.AES(self.shared_secret), modes.CTR(b'\x00' * 16), backend=default_backend())
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(encrypted_message) + decryptor.finalize()
+        return plaintext.decode()
+
+class PeerDiscovery:
+    def __init__(self, app):
+        self.app = app
+        self.discovered_users = {}
+        self.broadcast_address = "192.168.1.255"
+        self.port = 6000
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()  # Lock for thread safety
+        self.announcement_timer = None  # Initialize announcement timer variable
+
+    def start(self):
+        threading.Thread(target=self.listen_for_announcements, daemon=True).start()
+        # Start the announcement timer only if it's not already running
+        if not self.announcement_timer or not self.announcement_timer.is_alive():
+            self.announcement_timer = threading.Timer(0, self.start_announcement)
+            self.announcement_timer.start()
+
+    def start_announcement(self):
+        try:
+            message = {'username': self.app.get_username()}
+            json_message = json.dumps(message)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(json_message.encode(), (self.broadcast_address, self.port))
+            self.announcement_timer = threading.Timer(8, self.start_announcement)
+            self.announcement_timer.start()
+        except Exception as e:
+            self.app.show_error("Announcement Error", str(e))
+
+    def listen_for_announcements(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.bind(('0.0.0.0', self.port))
+                while not self.stop_event.is_set():
+                    data, addr = s.recvfrom(1024)
+                    message = json.loads(data.decode())
+                    username = message.get('username')
+                    if username:
+                        with self.lock:
+                            self.discovered_users[username] = {'ip': addr[0], 'last_seen': time.time()}
+                            self.app.update_user_display()
+        except Exception as e:
+            self.app.show_error("Announcement Listener Error", str(e))
+
+    def stop(self):
+        self.stop_event.set()
+        if hasattr(self, 'announcement_timer'):
+            self.announcement_timer.cancel()
+
+class ChatApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Chat App")
+        self.lock = threading.Lock()  # Lock for thread safety
+
+
+
+        self.username_label = tk.Label(root, text="Username:")
+        self.username_label.grid(row=0, column=0, padx=10, pady=10)
+        self.username_entry = tk.Entry(root, width=30)
+        self.username_entry.grid(row=1, column=0, padx=10, pady=(0, 10))
+
+        self.discovered_users_label = tk.Label(root, text="Discovered Users:")
+        self.discovered_users_label.grid(row=0, column=1, padx=10, pady=10)
+        self.discovered_users_text = scrolledtext.ScrolledText(root, width=40, height=10)
+        self.discovered_users_text.grid(row=1, column=1, padx=10, pady=10)
+
+        self.message_label = tk.Label(root, text="Message:")
+        self.message_label.grid(row=0, column=2, padx=10, pady=(0, 10))
+        self.message_entry = tk.Entry(root, width=40)
+        self.message_entry.grid(row=1, column=2, padx=10, pady=(0, 10))
+
+        self.start_button = tk.Button(root, text="Start", command=self.start_discovery)
+        self.start_button.grid(row=2, column=0, padx=10, pady=(0, 10))
+
+        self.chat_label = tk.Label(root, text="Chat:")
+        self.chat_label.grid(row=2, column=1, padx=10, pady=(0, 10))
+        self.chat_text = scrolledtext.ScrolledText(root, width=80, height=20)
+        self.chat_text.grid(row=3, column=1, columnspan=3, padx=10, pady=(0, 10))
+        
+        self.send_button = tk.Button(root, text="Send", command=self.send_message)
+        self.send_button.grid(row=2, column=2, padx=10, pady=(0, 10))
+
+        self.discovered_users_text.bind("<<ListboxSelect>>", self.on_user_selected)
+
+
+        self.peer_discovery = PeerDiscovery(self)
+        self.chat_instance = None
+
+        threading.Thread(target=self.start_listening_for_messages, daemon=True).start()
+
+    def start_listening_for_messages(self):
+        while True:
+            if self.chat_instance:
+                self.chat_instance.receive_messages()
+            time.sleep(1)
+
+    def start_discovery(self):
+        username = self.get_username()
+        if not username:
+            self.show_error("Error", "Please enter your username.")
+            return
+        self.username_entry.config(state="disabled")
+        self.start_button.config(state="disabled")
+        self.peer_discovery.start()
+
+    def update_user_display(self):
+        with self.lock:
+            self.discovered_users_text.delete(1.0, tk.END)
+            for username, info in self.peer_discovery.discovered_users.items():
+                last_seen = time.time() - info['last_seen']
+                if last_seen <= 10:
+                    status = "(Online)"
+                elif last_seen <= 15 * 60:
+                    status = "(Away)"
+                else:
+                    status = "(Offline)"
+                self.discovered_users_text.insert(tk.END, f"{username} {status}\n")
+
+    def send_message(self):
+        if not self.chat_instance:
+            self.show_error("Error", "Please select a user to chat with.")
+            return
+        message = self.message_entry.get()
+        if not message:
+            return
+        self.chat_instance.send_message(message)
+        self.message_entry.delete(0, tk.END)
+
+    def get_username(self):
+        return self.username_entry.get()
+
+    def update_chat_display(self, message):
+        self.chat_text.insert(tk.END, f"{message}\n")
+
+    def show_error(self, title, message):
+        messagebox.showerror(title, message)
+
+    def start_chat(self, username):
+        if username not in self.peer_discovery.discovered_users:
+            self.show_error("Error", "Selected user is not online.")
+            return
+        peer_ip = self.peer_discovery.discovered_users[username]['ip']
+        secure_chat = messagebox.askyesno("Secure Chat", "Do you want to chat securely?")
+        if secure_chat:
+            dh = DiffieHellman()
+            public_key = dh.get_public_key()
+            json_message = json.dumps({"key": public_key})
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((peer_ip, 6001))
+                    s.sendall(json_message.encode())
+                    data = s.recv(1024)
+                    peer_public_key = json.loads(data.decode())['key']
+                    shared_secret = dh.generate_shared_secret(peer_public_key)
+                    s.close()
+                    self.chat_instance = DefaultChat(self, username, peer_ip, shared_secret)
+            except Exception as e:
+                self.show_error("Chat Initialization Error", str(e))
+        else:
+            self.chat_instance = DefaultChat(self, username, peer_ip, None)
+        threading.Thread(target=self.chat_instance.receive_messages, daemon=True).start()
+
+    def on_user_selected(self, event):
+        selected_index = self.discovered_users_text.curselection()
+        if selected_index:
+            username = self.discovered_users_text.get(selected_index)
+            self.start_chat(username)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ChatApp(root)
+    root.mainloop()
